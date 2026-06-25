@@ -2,22 +2,26 @@ name: Android CI
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main, master ] # Runs automatically on push, plus manual dispatch
+  pull_request:
+    branches: [ main, master ]
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     environment: BuildAPK
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
     - name: Set up JDK 21
       uses: actions/setup-java@v4
       with:
         java-version: '21'
         distribution: 'temurin'
-        cache: gradle
+        cache: 'gradle' # Automatically caches gradle dependencies
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
@@ -25,17 +29,20 @@ jobs:
     - name: Create google-services.json
       run: echo "${{ secrets.GOOGLE_SERVICES_JSON }}" | base64 --decode > app/google-services.json
 
-    - name: Send notification to Telegram
-      run: |
-        if [[ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]]; then
-          for chat in \
-            "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d message_thread_id=8" \
-            "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID_VEC }}"; do
-            curl -s -o /dev/null -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-                 $chat \
-                 -d $'text=New update available on GitHub repository and building APK.\nPlease wait about 5 minutes.\nRun ID: '${GITHUB_RUN_ID}
-          done
-        fi
+    - name: Send Build Start Notification to Telegram
+      uses: appleboy/telegram-action@master
+      if: env.HAS_TELEGRAM == 'true'
+      env:
+        HAS_TELEGRAM: ${{ secrets.TELEGRAM_BOT_TOKEN != '' }}
+      with:
+        to: |
+          ${{ secrets.TELEGRAM_CHAT_ID }}
+          ${{ secrets.TELEGRAM_CHAT_ID_VEC }}
+        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        format: markdown
+        message: |
+          Building APK for Run ID: `${{ github.run_id }}`
+          Please wait about 3-5 minutes.
 
     - name: Build Debug APK
       run: ./gradlew assembleDebug
@@ -43,63 +50,60 @@ jobs:
     - name: Build Release APK
       run: ./gradlew assembleRelease
 
-    - name: Upload Debug APK as artifact
+    # OPTIONAL BUT RECOMMENDED: Sign the release APK if you have secrets configured
+    - name: Sign Release APK
+      uses: r0adkll/sign-android-release@v1
+      id: sign_app
+      if: env.HAS_SIGNING == 'true'
+      env:
+        HAS_SIGNING: ${{ secrets.KEYSTORE != '' }}
+      with:
+        releaseDirectory: app/build/outputs/apk/release
+        signingKeyBase64: ${{ secrets.KEYSTORE }}
+        alias: ${{ secrets.ALIAS }}
+        keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+        keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+    - name: Upload Debug APK to GitHub Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: android-debug-apk
         path: app/build/outputs/apk/debug/app-debug.apk
 
-    - name: Upload Release APK as artifact
+    - name: Upload Release APK to GitHub Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: android-release-apk
-        path: app/build/outputs/apk/release/app-release.apk
+        path: |
+          app/build/outputs/apk/release/*-signed.apk
+          app/build/outputs/apk/release/app-release.apk
+        if-no-files-found: warn
 
-    - name: Upload to Telegram 
-      run: |
-          if [[ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]]; then
-            success=true
+    - name: Upload APKs to Telegram
+      uses: appleboy/telegram-action@master
+      if: always() && secrets.TELEGRAM_BOT_TOKEN != ''
+      with:
+        to: |
+          ${{ secrets.TELEGRAM_CHAT_ID }}
+          ${{ secrets.TELEGRAM_CHAT_ID_VEC }}
+        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        document: app/build/outputs/apk/debug/app-debug.apk
+        format: markdown
+        message: |
+         Built successfully.
+          Note: This is an automated beta build from the repository.
+          
+          Explore beta releases here: [GitHub Releases](https://github.com/AnBui2004/Vectras-VM-Emu-Android/releases)
+          *Run ID:* `${{ github.run_id }}`
 
-            for file in app/build/outputs/apk/release/*.apk; do
-              echo "Uploading $(basename "$file")"
-              tries=0
-              success_file=false
-              until [ $tries -ge 5 ]; do
-                success_targets=false
-                for target in \
-                  "-F chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -F message_thread_id=8" \
-                  "-F chat_id=${{ secrets.TELEGRAM_CHAT_ID_VEC }}"; do
-
-                  if curl -s -o /dev/null -F document=@"$file" $target \
-                          -F $'caption=Done! Note that this is a version that is automatically built when there are changes in the GitHub repository, not the official version. Please only install it if you really want to see what is new.\nExplore beta releases here: https://github.com/AnBui2004/Vectras-VM-Emu-Android/releases\nRun ID: '${GITHUB_RUN_ID} \
-                          https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument; then
-                    success_targets=true
-                  else
-                    echo "Retrying upload for $file to target..."
-                    sleep 2
-                  fi
-                done
-
-                if $success_targets; then
-                  success_file=true
-                  break
-                fi
-                tries=$((tries+1))
-              done
-
-              if ! $success_file; then
-                echo "Upload failed for $file"
-                success=false
-              fi
-            done
-
-            if [ "$success" = false ]; then
-              for chat in \
-                "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID }} -d message_thread_id=8" \
-                "-d chat_id=${{ secrets.TELEGRAM_CHAT_ID_VEC }}"; do
-                curl -s -o /dev/null -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-                     $chat \
-                    -d $'text=Something went wrong and the APK file could not be uploaded.\nExplore beta releases here: https://github.com/AnBui2004/Vectras-VM-Emu-Android/releases\nRun ID: '${GITHUB_RUN_ID}
-              done
-            fi
-          fi
+    - name: Notify on Failure
+      uses: appleboy/telegram-action@master
+      if: failure() && secrets.TELEGRAM_BOT_TOKEN != ''
+      with:
+        to: |
+          ${{ secrets.TELEGRAM_CHAT_ID }}
+          ${{ secrets.TELEGRAM_CHAT_ID_VEC }}
+        token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        message: |
+          Something went wrong and the APK file could not be compiled or uploaded.
+          Run ID: ${{ github.run_id }}
